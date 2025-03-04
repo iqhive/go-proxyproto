@@ -1,10 +1,6 @@
 # go-proxyproto
 
-[![Actions Status](https://github.com/iqhive/go-proxyproto/workflows/test/badge.svg)](https://github.com/iqhive/go-proxyproto/actions)
-[![Coverage Status](https://coveralls.io/repos/github/pires/go-proxyproto/badge.svg?branch=master)](https://coveralls.io/github/pires/go-proxyproto?branch=master)
-[![Go Report Card](https://goreportcard.com/badge/github.com/iqhive/go-proxyproto)](https://goreportcard.com/report/github.com/iqhive/go-proxyproto)
-[![](https://godoc.org/github.com/iqhive/go-proxyproto?status.svg)](https://pkg.go.dev/github.com/iqhive/go-proxyproto?tab=doc)
-
+Forked from [pires/go-proxyproto](https://github.com/pires/go-proxyproto)
 
 A Go library implementation of the [PROXY protocol, versions 1 and 2](https://www.haproxy.org/download/2.3/doc/proxy-protocol.txt),
 which provides, as per specification:
