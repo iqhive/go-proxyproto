@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/pires/go-proxyproto"
+	"github.com/iqhive/go-proxyproto"
 )
 
 var awsTestCases = []struct {

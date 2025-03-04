@@ -6,7 +6,7 @@ package tlvparse
 import (
 	"encoding/binary"
 
-	"github.com/pires/go-proxyproto"
+	"github.com/iqhive/go-proxyproto"
 )
 
 const (
@@ -23,6 +23,7 @@ func isAzurePrivateEndpointLinkID(tlv proxyproto.TLV) bool {
 // AzurePrivateEndpointLinkID returns linkID if given TLV matches Azure Private Endpoint LinkID format
 //
 // Format description:
+//
 //	Field	Length (Octets)	Description
 //	Type	1	PP2_TYPE_AZURE (0xEE)
 //	Length	2	Length of value

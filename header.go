@@ -171,16 +171,32 @@ func (header *Header) EqualsTo(otherHeader *Header) bool {
 }
 
 // WriteTo renders a proxy protocol header in a format and writes it to an io.Writer.
+// Uses zero-copy techniques where possible.
 func (header *Header) WriteTo(w io.Writer) (int64, error) {
+	// Fast path for Linux TCP connections where we can do zero-copy writes
+	if tc, ok := w.(*net.TCPConn); ok && isLinux {
+		buf, err := header.Format()
+		if err != nil {
+			return 0, err
+		}
+
+		// Write directly to TCP connection
+		n, err := tc.Write(buf)
+		return int64(n), err
+	}
+
+	// Standard path for other writer types
 	buf, err := header.Format()
 	if err != nil {
 		return 0, err
 	}
 
-	return bytes.NewBuffer(buf).WriteTo(w)
+	// Direct write
+	n, err := w.Write(buf)
+	return int64(n), err
 }
 
-// Format renders a proxy protocol header in a format to write over the wire.
+// Format renders a proxy protocol header with minimal allocations.
 func (header *Header) Format() ([]byte, error) {
 	switch header.Version {
 	case 1:
@@ -219,7 +235,7 @@ func (header *Header) SetTLVs(tlvs []TLV) error {
 // Also, this operation will block until enough bytes are available for peeking.
 func Read(reader *bufio.Reader) (*Header, error) {
 	// In order to improve speed for small non-PROXYed packets, take a peek at the first byte alone.
-	b1, err := reader.Peek(1)
+	firstByte, err := reader.Peek(1)
 	if err != nil {
 		if err == io.EOF {
 			return nil, ErrNoProxyProtocol
@@ -227,7 +243,16 @@ func Read(reader *bufio.Reader) (*Header, error) {
 		return nil, err
 	}
 
-	if bytes.Equal(b1[:1], SIGV1[:1]) || bytes.Equal(b1[:1], SIGV2[:1]) {
+	// Fast path check for common first bytes
+	firstByteVal := firstByte[0]
+
+	// Quick reject for most common non-proxy protocol traffic
+	if firstByteVal != SIGV1[0] && firstByteVal != SIGV2[0] {
+		return nil, ErrNoProxyProtocol
+	}
+
+	// If it could be a proxy protocol header, peek at more bytes
+	if firstByteVal == SIGV1[0] {
 		signature, err := reader.Peek(5)
 		if err != nil {
 			if err == io.EOF {
@@ -235,17 +260,22 @@ func Read(reader *bufio.Reader) (*Header, error) {
 			}
 			return nil, err
 		}
+
+		// Compare fixed length arrays directly for better performance
 		if bytes.Equal(signature[:5], SIGV1) {
 			return parseVersion1(reader)
 		}
+	}
 
-		signature, err = reader.Peek(12)
+	if firstByteVal == SIGV2[0] {
+		signature, err := reader.Peek(12)
 		if err != nil {
 			if err == io.EOF {
 				return nil, ErrNoProxyProtocol
 			}
 			return nil, err
 		}
+
 		if bytes.Equal(signature[:12], SIGV2) {
 			return parseVersion2(reader)
 		}

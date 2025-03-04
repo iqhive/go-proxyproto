@@ -5,7 +5,7 @@ import (
 	"log"
 	"net"
 
-	proxyproto "github.com/pires/go-proxyproto"
+	proxyproto "github.com/iqhive/go-proxyproto"
 )
 
 func chkErr(err error) {

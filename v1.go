@@ -2,7 +2,6 @@ package proxyproto
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"net"
 	"net/netip"
@@ -34,40 +33,15 @@ func parseVersion1(reader *bufio.Reader) (*Header, error) {
 	//   So a 108-byte buffer is always enough to store all the line and a
 	//   trailing zero for string processing.
 	//
-	// It must also be CRLF terminated, as above. The header does not otherwise
-	// contain a CR or LF byte.
-	//
-	// ISSUE #69
-	// We can't use Peek here as it will block trying to fill the buffer, which
-	// will never happen if the header is TCP4 or TCP6 (max. 56 and 104 bytes
-	// respectively) and the server is expected to speak first.
-	//
-	// Similarly, we can't use ReadString or ReadBytes as these will keep reading
-	// until the delimiter is found; an abusive client could easily disrupt a
-	// server by sending a large amount of data that do not contain a LF byte.
-	// Another means of attack would be to start connections and simply not send
-	// data after the initial PROXY signature bytes, accumulating a large
-	// number of blocked goroutines on the server. ReadSlice will also block for
-	// a delimiter when the internal buffer does not fill up.
-	//
-	// A plain Read is also problematic since we risk reading past the end of the
-	// header without being able to easily put the excess bytes back into the reader's
-	// buffer (with the current implementation's design).
-	//
-	// So we use a ReadByte loop, which solves the overflow problem and avoids
-	// reading beyond the end of the header. However, we need one more trick to harden
-	// against partial header attacks (slow loris) - per spec:
-	//
-	//    (..) The sender must always ensure that the header is sent at once, so that
-	//    the transport layer maintains atomicity along the path to the receiver. The
-	//    receiver may be tolerant to partial headers or may simply drop the connection
-	//    when receiving a partial header. Recommendation is to be tolerant, but
-	//    implementation constraints may not always easily permit this.
-	//
-	// We are subject to such implementation constraints. So we return an error if
-	// the header cannot be fully extracted with a single read of the underlying
-	// reader.
-	buf := make([]byte, 0, 107)
+	//   It must also be CRLF terminated, as above. The header does not otherwise
+	//   contain a CR or LF byte.
+
+	// Get a buffer from the pool
+	bufPtr := getBuffer()
+	buf := *bufPtr
+
+	defer putBuffer(bufPtr) // Return the buffer to the pool when done
+
 	for {
 		b, err := reader.ReadByte()
 		if err != nil {
@@ -90,12 +64,16 @@ func parseVersion1(reader *bufio.Reader) (*Header, error) {
 		}
 	}
 
+	// Update the buffer in the pool pointer
+	*bufPtr = buf
+
 	// Check for CR before LF.
 	if len(buf) < 2 || buf[len(buf)-2] != '\r' {
 		return nil, ErrLineMustEndWithCrlf
 	}
 
-	// Check full signature.
+	// Note: Using string() here allocates, but seems unavoidable due to Split
+	// We could manually parse the string to avoid Split if needed for more performance
 	tokens := strings.Split(string(buf[:len(buf)-2]), separator)
 
 	// Expect at least 2 tokens: "PROXY" and the transport protocol.
@@ -165,25 +143,22 @@ func parseVersion1(reader *bufio.Reader) (*Header, error) {
 }
 
 func (header *Header) formatVersion1() ([]byte, error) {
-	// As of version 1, only "TCP4" ( \x54 \x43 \x50 \x34 ) for TCP over IPv4,
-	// and "TCP6" ( \x54 \x43 \x50 \x36 ) for TCP over IPv6 are allowed.
-	var proto string
-	switch header.TransportProtocol {
-	case TCPv4:
-		proto = "TCP4"
-	case TCPv6:
-		proto = "TCP6"
-	default:
-		// Unknown connection (short form)
-		return []byte("PROXY UNKNOWN" + crlf), nil
+	// For unknown connections (short form), just return a static byte slice
+	if header.TransportProtocol != TCPv4 && header.TransportProtocol != TCPv6 {
+		// Use pre-allocated static slice
+		result := make([]byte, 15) // "PROXY UNKNOWN\r\n"
+		copy(result, "PROXY UNKNOWN\r\n")
+		return result, nil
 	}
 
+	// Validate addresses
 	sourceAddr, sourceOK := header.SourceAddr.(*net.TCPAddr)
 	destAddr, destOK := header.DestinationAddr.(*net.TCPAddr)
 	if !sourceOK || !destOK {
 		return nil, ErrInvalidAddress
 	}
 
+	// Get IPs in the right format
 	sourceIP, destIP := sourceAddr.IP, destAddr.IP
 	switch header.TransportProtocol {
 	case TCPv4:
@@ -193,25 +168,49 @@ func (header *Header) formatVersion1() ([]byte, error) {
 		sourceIP = sourceIP.To16()
 		destIP = destIP.To16()
 	}
+
 	if sourceIP == nil || destIP == nil {
 		return nil, ErrInvalidAddress
 	}
 
-	buf := bytes.NewBuffer(make([]byte, 0, 108))
-	buf.Write(SIGV1)
-	buf.WriteString(separator)
-	buf.WriteString(proto)
-	buf.WriteString(separator)
-	buf.WriteString(sourceIP.String())
-	buf.WriteString(separator)
-	buf.WriteString(destIP.String())
-	buf.WriteString(separator)
-	buf.WriteString(strconv.Itoa(sourceAddr.Port))
-	buf.WriteString(separator)
-	buf.WriteString(strconv.Itoa(destAddr.Port))
-	buf.WriteString(crlf)
+	// Pre-calculate the exact buffer size we need
+	// "PROXY TCP4 " or "PROXY TCP6 " = 11 bytes
+	// source IP + " " = len(sourceIP.String()) + 1
+	// dest IP + " " = len(destIP.String()) + 1
+	// source port + " " = len(strconv.Itoa(sourceAddr.Port)) + 1
+	// dest port + "\r\n" = len(strconv.Itoa(destAddr.Port)) + 2
+	sourceIPStr := sourceIP.String()
+	destIPStr := destIP.String()
+	sourcePortStr := strconv.Itoa(sourceAddr.Port)
+	destPortStr := strconv.Itoa(destAddr.Port)
 
-	return buf.Bytes(), nil
+	totalLen := 11 + len(sourceIPStr) + 1 + len(destIPStr) + 1 +
+		len(sourcePortStr) + 1 + len(destPortStr) + 2
+
+	// Allocate the exact buffer size we need
+	buf := make([]byte, 0, totalLen)
+
+	// Build the header directly using append to avoid temporary allocations
+	buf = append(buf, SIGV1...)
+	buf = append(buf, separator...)
+
+	if header.TransportProtocol == TCPv4 {
+		buf = append(buf, "TCP4"...)
+	} else {
+		buf = append(buf, "TCP6"...)
+	}
+
+	buf = append(buf, separator...)
+	buf = append(buf, sourceIPStr...)
+	buf = append(buf, separator...)
+	buf = append(buf, destIPStr...)
+	buf = append(buf, separator...)
+	buf = append(buf, sourcePortStr...)
+	buf = append(buf, separator...)
+	buf = append(buf, destPortStr...)
+	buf = append(buf, crlf...)
+
+	return buf, nil
 }
 
 func parseV1PortNumber(portStr string) (int, error) {

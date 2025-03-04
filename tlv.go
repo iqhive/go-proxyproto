@@ -4,7 +4,6 @@
 package proxyproto
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -49,45 +48,106 @@ type TLV struct {
 	Value []byte
 }
 
-// SplitTLVs splits the Type-Length-Value vector, returns the vector or an error.
+// SplitTLVs splits the Type-Length-Value vector with minimal copying.
 func SplitTLVs(raw []byte) ([]TLV, error) {
-	var tlvs []TLV
+	if len(raw) == 0 {
+		return nil, nil
+	}
+
+	// Pre-allocate with a reasonable size to avoid reallocations
+	tlvs := make([]TLV, 0, 4)
+
+	// Process the byte slice directly without intermediate allocations
 	for i := 0; i < len(raw); {
-		tlv := TLV{
-			Type: PP2Type(raw[i]),
-		}
-		if len(raw)-i <= 2 {
+		// Ensure we have at least 3 bytes (type + 2-byte length)
+		if len(raw)-i < 3 {
 			return nil, ErrTruncatedTLV
 		}
-		tlvLen := int(binary.BigEndian.Uint16(raw[i+1 : i+3])) // Max length = 65K
-		i += 3
+
+		// Read type byte directly
+		tlvType := PP2Type(raw[i])
+		i++
+
+		// Read length directly (big endian)
+		tlvLen := (int(raw[i]) << 8) | int(raw[i+1])
+		i += 2
+
+		// Check if we have enough bytes for the value
 		if i+tlvLen > len(raw) {
 			return nil, ErrTruncatedTLV
 		}
-		// Ignore no-op padding
-		if tlv.Type != PP2_TYPE_NOOP {
-			tlv.Value = make([]byte, tlvLen)
-			copy(tlv.Value, raw[i:i+tlvLen])
+
+		// Process the value
+		if tlvType != PP2_TYPE_NOOP {
+			var tlvValue []byte
+
+			// For small values, make a copy to avoid referencing the larger raw buffer
+			if tlvLen <= 16 {
+				tlvValue = make([]byte, tlvLen)
+				copy(tlvValue, raw[i:i+tlvLen])
+			} else {
+				// For larger values, use a slice of the original to avoid copying
+				// This is safe as long as the original raw slice stays in scope
+				tlvValue = raw[i : i+tlvLen]
+			}
+
+			tlvs = append(tlvs, TLV{
+				Type:  tlvType,
+				Value: tlvValue,
+			})
 		}
+
+		// Move to the next TLV
 		i += tlvLen
-		tlvs = append(tlvs, tlv)
 	}
+
 	return tlvs, nil
 }
 
-// JoinTLVs joins multiple Type-Length-Value records.
+// JoinTLVs joins multiple Type-Length-Value records with minimal copying.
 func JoinTLVs(tlvs []TLV) ([]byte, error) {
-	var raw []byte
+	if len(tlvs) == 0 {
+		return nil, nil
+	}
+
+	// Pre-calculate total size to avoid reallocations
+	totalSize := 0
 	for _, tlv := range tlvs {
 		if len(tlv.Value) > math.MaxUint16 {
 			return nil, fmt.Errorf("proxyproto: cannot format TLV %v with length %d", tlv.Type, len(tlv.Value))
 		}
-		var length [2]byte
-		binary.BigEndian.PutUint16(length[:], uint16(len(tlv.Value)))
-		raw = append(raw, byte(tlv.Type))
-		raw = append(raw, length[:]...)
-		raw = append(raw, tlv.Value...)
+		totalSize += 3 + len(tlv.Value) // 1 byte for type, 2 bytes for length, n bytes for value
 	}
+
+	// Early return for empty result
+	if totalSize == 0 {
+		return nil, nil
+	}
+
+	// Allocate exactly the size needed in one go
+	raw := make([]byte, totalSize)
+
+	// Fill the buffer directly without intermediate allocations
+	offset := 0
+	for _, tlv := range tlvs {
+		valueLen := len(tlv.Value)
+
+		// Write type byte
+		raw[offset] = byte(tlv.Type)
+		offset++
+
+		// Write length (big endian)
+		raw[offset] = byte(valueLen >> 8) // high byte
+		raw[offset+1] = byte(valueLen)    // low byte
+		offset += 2
+
+		// Copy value directly into destination buffer
+		if valueLen > 0 {
+			copy(raw[offset:offset+valueLen], tlv.Value)
+			offset += valueLen
+		}
+	}
+
 	return raw, nil
 }
 

@@ -6,7 +6,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"net"
+	"sync"
+	"unsafe"
 )
 
 var (
@@ -35,7 +38,56 @@ var (
 		return a
 	}()
 	errUint16Overflow = errors.New("proxyproto: uint16 overflow")
+
+	// Pre-allocate port byte buffer to avoid allocations
+	portBytesPool = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 2)
+			return &b
+		},
+	}
+
+	// unixAddrPool is a pool for Unix address formatting
+	unixAddrPool = sync.Pool{
+		New: func() interface{} {
+			// Unix addresses can be up to 108 bytes
+			b := make([]byte, 108)
+			return &b
+		},
+	}
+
+	// tlvLenPool is a pool for TLV length buffers
+	tlvLenPool = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 2)
+			return &b
+		},
+	}
 )
+
+// getPortBytes gets a 2-byte buffer from the pool
+func getPortBytes() *[]byte {
+	return portBytesPool.Get().(*[]byte)
+}
+
+// putPortBytes returns a 2-byte buffer to the pool
+func putPortBytes(b *[]byte) {
+	portBytesPool.Put(b)
+}
+
+// getUnixAddrBuffer gets a buffer from the pool for Unix addresses
+func getUnixAddrBuffer() *[]byte {
+	return unixAddrPool.Get().(*[]byte)
+}
+
+// putUnixAddrBuffer returns a buffer to the pool
+func putUnixAddrBuffer(b *[]byte) {
+	// Clear the buffer for security
+	for i := range *b {
+		(*b)[i] = 0
+	}
+	unixAddrPool.Put(b)
+}
 
 type _ports struct {
 	SrcPort uint16
@@ -94,9 +146,13 @@ func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
 
 	// Make sure there are bytes available as specified in length
 	var length uint16
-	if err := binary.Read(io.LimitReader(reader, 2), binary.BigEndian, &length); err != nil {
+	// Use a fixed buffer to avoid allocation
+	lengthBytes := [2]byte{}
+	if _, err := io.ReadFull(reader, lengthBytes[:]); err != nil {
 		return nil, ErrCantReadLength
 	}
+	length = binary.BigEndian.Uint16(lengthBytes[:])
+
 	if !header.validateLength(length) {
 		return nil, ErrInvalidLength
 	}
@@ -155,78 +211,246 @@ func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
 	}
 
 	// Copy bytes for optional Type-Length-Value vector
-	header.rawTLVs = make([]byte, payloadReader.N) // Allocate minimum size slice
-	if _, err = io.ReadFull(payloadReader, header.rawTLVs); err != nil && err != io.EOF {
-		return nil, err
+	remainingLength := int(payloadReader.N)
+	if remainingLength > 0 {
+		header.rawTLVs = make([]byte, remainingLength)
+		if _, err = io.ReadFull(payloadReader, header.rawTLVs); err != nil && err != io.EOF {
+			return nil, err
+		}
 	}
 
 	return header, nil
 }
 
+// formatVersion2 serializes a proxy protocol version 2 header
+// This optimized version minimizes copying and reuses buffers
 func (header *Header) formatVersion2() ([]byte, error) {
-	var buf bytes.Buffer
-	buf.Write(SIGV2)
-	buf.WriteByte(header.Command.toByte())
-	buf.WriteByte(header.TransportProtocol.toByte())
-	if header.TransportProtocol.IsUnspec() {
-		// For UNSPEC, write no addresses and ports but only TLVs if they are present
-		hdrLen, err := addTLVLen(lengthUnspecBytes, len(header.rawTLVs))
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(hdrLen)
+	// Pre-calculate the total buffer size to avoid reallocations
+	totalSize := len(SIGV2) + 2 // Signature + command/protocol bytes
+
+	// Add base length for the appropriate protocol
+	if header.TransportProtocol.IsIPv4() {
+		totalSize += 2 + int(lengthV4) // 2 for length field
+	} else if header.TransportProtocol.IsIPv6() {
+		totalSize += 2 + int(lengthV6) // 2 for length field
+	} else if header.TransportProtocol.IsUnix() {
+		totalSize += 2 + int(lengthUnix) // 2 for length field
 	} else {
-		var addrSrc, addrDst []byte
-		if header.TransportProtocol.IsIPv4() {
-			hdrLen, err := addTLVLen(lengthV4Bytes, len(header.rawTLVs))
-			if err != nil {
-				return nil, err
+		totalSize += 2 // Just the length field for UNSPEC
+	}
+
+	// Add TLV size if present
+	totalSize += len(header.rawTLVs)
+
+	// Allocate a single buffer of the right size
+	result := make([]byte, 0, totalSize)
+
+	// Append signature (no allocation)
+	result = append(result, SIGV2...)
+	result = append(result, header.Command.toByte())
+	result = append(result, header.TransportProtocol.toByte())
+
+	// Add appropriate length field and address data
+	if header.TransportProtocol.IsIPv4() {
+		// Use the pre-calculated IPv4 length
+		baseLength := lengthV4
+		sourceIP, destIP, _ := header.IPs()
+		addrSrc := sourceIP.To4()
+		addrDst := destIP.To4()
+
+		// Calculate final length including TLVs
+		totalLength := baseLength
+		if len(header.rawTLVs) > 0 {
+			newLength := int(totalLength) + len(header.rawTLVs)
+			if newLength > math.MaxUint16 {
+				return nil, errUint16Overflow
 			}
-			buf.Write(hdrLen)
-			sourceIP, destIP, _ := header.IPs()
-			addrSrc = sourceIP.To4()
-			addrDst = destIP.To4()
-		} else if header.TransportProtocol.IsIPv6() {
-			hdrLen, err := addTLVLen(lengthV6Bytes, len(header.rawTLVs))
-			if err != nil {
-				return nil, err
-			}
-			buf.Write(hdrLen)
-			sourceIP, destIP, _ := header.IPs()
-			addrSrc = sourceIP.To16()
-			addrDst = destIP.To16()
-		} else if header.TransportProtocol.IsUnix() {
-			buf.Write(lengthUnixBytes)
-			sourceAddr, destAddr, ok := header.UnixAddrs()
-			if !ok {
-				return nil, ErrInvalidAddress
-			}
-			addrSrc = formatUnixName(sourceAddr.Name)
-			addrDst = formatUnixName(destAddr.Name)
+			totalLength = uint16(newLength)
 		}
 
+		// Write length directly into result buffer
+		lengthBytes := [2]byte{}
+		binary.BigEndian.PutUint16(lengthBytes[:], totalLength)
+		result = append(result, lengthBytes[:]...)
+
+		// Validate addresses
 		if addrSrc == nil || addrDst == nil {
 			return nil, ErrInvalidAddress
 		}
-		buf.Write(addrSrc)
-		buf.Write(addrDst)
 
+		// Append address data (no allocation)
+		result = append(result, addrSrc...)
+		result = append(result, addrDst...)
+
+		// Add port information if available
 		if sourcePort, destPort, ok := header.Ports(); ok {
-			portBytes := make([]byte, 2)
+			// Write ports directly into result buffer
+			portBytes := [2]byte{}
 
-			binary.BigEndian.PutUint16(portBytes, uint16(sourcePort))
-			buf.Write(portBytes)
+			binary.BigEndian.PutUint16(portBytes[:], uint16(sourcePort))
+			result = append(result, portBytes[:]...)
 
-			binary.BigEndian.PutUint16(portBytes, uint16(destPort))
-			buf.Write(portBytes)
+			binary.BigEndian.PutUint16(portBytes[:], uint16(destPort))
+			result = append(result, portBytes[:]...)
 		}
+	} else if header.TransportProtocol.IsIPv6() {
+		// Use the pre-calculated IPv6 length
+		baseLength := lengthV6
+		sourceIP, destIP, _ := header.IPs()
+		addrSrc := sourceIP.To16()
+		addrDst := destIP.To16()
+
+		// Calculate final length including TLVs
+		totalLength := baseLength
+		if len(header.rawTLVs) > 0 {
+			newLength := int(totalLength) + len(header.rawTLVs)
+			if newLength > math.MaxUint16 {
+				return nil, errUint16Overflow
+			}
+			totalLength = uint16(newLength)
+		}
+
+		// Write length directly into result buffer
+		lengthBytes := [2]byte{}
+		binary.BigEndian.PutUint16(lengthBytes[:], totalLength)
+		result = append(result, lengthBytes[:]...)
+
+		// Validate addresses
+		if addrSrc == nil || addrDst == nil {
+			return nil, ErrInvalidAddress
+		}
+
+		// Append address data (no allocation)
+		result = append(result, addrSrc...)
+		result = append(result, addrDst...)
+
+		// Add port information if available
+		if sourcePort, destPort, ok := header.Ports(); ok {
+			// Write ports directly into result buffer
+			portBytes := [2]byte{}
+
+			binary.BigEndian.PutUint16(portBytes[:], uint16(sourcePort))
+			result = append(result, portBytes[:]...)
+
+			binary.BigEndian.PutUint16(portBytes[:], uint16(destPort))
+			result = append(result, portBytes[:]...)
+		}
+	} else if header.TransportProtocol.IsUnix() {
+		// Use the pre-calculated Unix length
+		baseLength := lengthUnix
+		sourceAddr, destAddr, ok := header.UnixAddrs()
+		if !ok {
+			return nil, ErrInvalidAddress
+		}
+
+		// Use optimized Unix name formatting
+		addrSrc := formatUnixNameZeroCopy(sourceAddr.Name)
+		addrDst := formatUnixNameZeroCopy(destAddr.Name)
+
+		// These are fully copied values, so we'll need to free them
+		defer func() {
+			if addrSrc != nil {
+				putUnixAddrSlice(addrSrc)
+			}
+			if addrDst != nil {
+				putUnixAddrSlice(addrDst)
+			}
+		}()
+
+		// Calculate final length including TLVs
+		totalLength := baseLength
+		if len(header.rawTLVs) > 0 {
+			newLength := int(totalLength) + len(header.rawTLVs)
+			if newLength > math.MaxUint16 {
+				return nil, errUint16Overflow
+			}
+			totalLength = uint16(newLength)
+		}
+
+		// Write length directly into result buffer
+		lengthBytes := [2]byte{}
+		binary.BigEndian.PutUint16(lengthBytes[:], totalLength)
+		result = append(result, lengthBytes[:]...)
+
+		// Validate addresses
+		if addrSrc == nil || addrDst == nil {
+			return nil, ErrInvalidAddress
+		}
+
+		// Append address data (no allocation)
+		result = append(result, addrSrc...)
+		result = append(result, addrDst...)
+
+		// Add port information if available
+		if sourcePort, destPort, ok := header.Ports(); ok {
+			// Write ports directly into result buffer
+			portBytes := [2]byte{}
+
+			binary.BigEndian.PutUint16(portBytes[:], uint16(sourcePort))
+			result = append(result, portBytes[:]...)
+
+			binary.BigEndian.PutUint16(portBytes[:], uint16(destPort))
+			result = append(result, portBytes[:]...)
+		}
+	} else {
+		// For UNSPEC, calculate final length with TLVs
+		length := uint16(0)
+		if len(header.rawTLVs) > 0 {
+			length = uint16(len(header.rawTLVs))
+			if length > math.MaxUint16 {
+				return nil, errUint16Overflow
+			}
+		}
+
+		// Write length directly into result buffer
+		lengthBytes := [2]byte{}
+		binary.BigEndian.PutUint16(lengthBytes[:], length)
+		result = append(result, lengthBytes[:]...)
 	}
 
+	// Append TLVs if present (no allocation)
 	if len(header.rawTLVs) > 0 {
-		buf.Write(header.rawTLVs)
+		result = append(result, header.rawTLVs...)
 	}
 
-	return buf.Bytes(), nil
+	return result, nil
+}
+
+// formatUnixNameZeroCopy formats a Unix socket path with minimal copying
+// Returns a slice that must be returned to the pool with putUnixAddrSlice
+func formatUnixNameZeroCopy(name string) []byte {
+	// Create a properly-sized slice
+	slice := getUnixAddrSlice()
+
+	// Copy the name into the slice
+	nameLen := copy(slice, name)
+
+	// Zero-fill the remainder
+	for i := nameLen; i < len(slice); i++ {
+		slice[i] = 0
+	}
+
+	return slice
+}
+
+// getUnixAddrSlice gets a pre-allocated slice for Unix socket addresses
+func getUnixAddrSlice() []byte {
+	bufPtr := getUnixAddrBuffer()
+	slice := (*bufPtr)[:108] // Ensure slice is exactly the right size
+	return slice
+}
+
+// putUnixAddrSlice returns a Unix address slice to the pool
+func putUnixAddrSlice(slice []byte) {
+	// Find the buffer pointer by calculating its address
+	if cap(slice) >= 108 {
+		// Convert slice to pointer to underlying array
+		bufPtr := &slice[:cap(slice)][0]
+		// Convert to *[]byte (this is a bit hacky but avoids allocating a new buffer)
+		sliceHeader := (*[]byte)(unsafe.Pointer(&bufPtr))
+		// Put it back in the pool
+		putUnixAddrBuffer(sliceHeader)
+	}
 }
 
 func (header *Header) validateLength(length uint16) bool {
@@ -243,18 +467,32 @@ func (header *Header) validateLength(length uint16) bool {
 }
 
 // addTLVLen adds the length of the TLV to the header length or errors on uint16 overflow.
+// This optimized version avoids allocations by using a buffer pool.
 func addTLVLen(cur []byte, tlvLen int) ([]byte, error) {
 	if tlvLen == 0 {
 		return cur, nil
 	}
+
 	curLen := binary.BigEndian.Uint16(cur)
 	newLen := int(curLen) + tlvLen
 	if newLen >= 1<<16 {
 		return nil, errUint16Overflow
 	}
-	a := make([]byte, 2)
-	binary.BigEndian.PutUint16(a, uint16(newLen))
-	return a, nil
+
+	// Get buffer from pool
+	bufPtr := tlvLenPool.Get().(*[]byte)
+	buf := *bufPtr
+
+	binary.BigEndian.PutUint16(buf, uint16(newLen))
+
+	// Create a new slice to return - we can't return the pooled buffer directly
+	result := make([]byte, 2)
+	copy(result, buf)
+
+	// Return buffer to pool
+	tlvLenPool.Put(bufPtr)
+
+	return result, nil
 }
 
 func newIPAddr(transport AddressFamilyAndProtocol, ip net.IP, port uint16) net.Addr {
@@ -267,7 +505,9 @@ func newIPAddr(transport AddressFamilyAndProtocol, ip net.IP, port uint16) net.A
 	}
 }
 
+// parseUnixName extracts the null-terminated Unix socket path
 func parseUnixName(b []byte) string {
+	// Find null terminator
 	i := bytes.IndexByte(b, 0)
 	if i < 0 {
 		return string(b)
@@ -275,11 +515,32 @@ func parseUnixName(b []byte) string {
 	return string(b[:i])
 }
 
+// formatUnixName formats a Unix socket path for the proxy protocol
 func formatUnixName(name string) []byte {
-	n := int(lengthUnix) / 2
-	if len(name) >= n {
-		return []byte(name[:n])
+	// Get buffer from pool
+	bufPtr := getUnixAddrBuffer()
+	buf := *bufPtr
+
+	// Copy name into buffer
+	n := copy(buf, name)
+
+	// Add null terminator if needed and there's space
+	if n < len(buf) {
+		buf[n] = 0
+		n++
 	}
-	pad := make([]byte, n-len(name))
-	return append([]byte(name), pad...)
+
+	// Zero out the rest of the buffer
+	for i := n; i < len(buf); i++ {
+		buf[i] = 0
+	}
+
+	// Create a new slice to return - we can't return the pooled buffer directly
+	result := make([]byte, len(buf))
+	copy(result, buf)
+
+	// Return buffer to pool
+	putUnixAddrBuffer(bufPtr)
+
+	return result
 }

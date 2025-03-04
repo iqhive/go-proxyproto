@@ -1,9 +1,9 @@
 # go-proxyproto
 
-[![Actions Status](https://github.com/pires/go-proxyproto/workflows/test/badge.svg)](https://github.com/pires/go-proxyproto/actions)
+[![Actions Status](https://github.com/iqhive/go-proxyproto/workflows/test/badge.svg)](https://github.com/iqhive/go-proxyproto/actions)
 [![Coverage Status](https://coveralls.io/repos/github/pires/go-proxyproto/badge.svg?branch=master)](https://coveralls.io/github/pires/go-proxyproto?branch=master)
-[![Go Report Card](https://goreportcard.com/badge/github.com/pires/go-proxyproto)](https://goreportcard.com/report/github.com/pires/go-proxyproto)
-[![](https://godoc.org/github.com/pires/go-proxyproto?status.svg)](https://pkg.go.dev/github.com/pires/go-proxyproto?tab=doc)
+[![Go Report Card](https://goreportcard.com/badge/github.com/iqhive/go-proxyproto)](https://goreportcard.com/report/github.com/iqhive/go-proxyproto)
+[![](https://godoc.org/github.com/iqhive/go-proxyproto?status.svg)](https://pkg.go.dev/github.com/iqhive/go-proxyproto?tab=doc)
 
 
 A Go library implementation of the [PROXY protocol, versions 1 and 2](https://www.haproxy.org/download/2.3/doc/proxy-protocol.txt),
@@ -17,10 +17,24 @@ which provides, as per specification:
 This library is to be used in one of or both proxy clients and proxy servers that need to support said protocol.
 Both protocol versions, 1 (text-based) and 2 (binary-based) are supported.
 
+Key changes from the original fork:
+- Optimize buffer handling by implementing a sync.Pool for buffers
+- Preallocate TLV buffers to reduce memory allocations
+- Linux specific (netpoll/epoll) optimizations
+- Optimize TCP socket settings
+- Avoid allocations when adding a TLV to the header
+- Pre-sized buffers to exact sizes needed, reducing resizing and extra allocations
+- Using slice operations instead of copying data where possible
+- Using unsafe pointers in specific places for zero-copy memory manipulation
+- Implemented Linux-specific zero-copy TCP operations using optimized I/O
+- Writing directly into pre-allocated buffers instead of using intermediate buffers
+- Efficient String Handling: Pre-calculating string lengths and using direct append operations
+
+
 ## Installation
 
 ```shell
-$ go get -u github.com/pires/go-proxyproto
+$ go get -u github.com/iqhive/go-proxyproto
 ```
 
 ## Usage
@@ -35,7 +49,7 @@ import (
 	"log"
 	"net"
 
-	proxyproto "github.com/pires/go-proxyproto"
+	proxyproto "github.com/iqhive/go-proxyproto"
 )
 
 func chkErr(err error) {
@@ -87,7 +101,7 @@ import (
 	"log"
 	"net"
 
-	proxyproto "github.com/pires/go-proxyproto"
+	proxyproto "github.com/iqhive/go-proxyproto"
 )
 
 func main() {
@@ -128,7 +142,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/pires/go-proxyproto"
+	"github.com/iqhive/go-proxyproto"
 )
 
 func main() {

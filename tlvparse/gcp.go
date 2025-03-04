@@ -3,7 +3,7 @@ package tlvparse
 import (
 	"encoding/binary"
 
-	"github.com/pires/go-proxyproto"
+	"github.com/iqhive/go-proxyproto"
 )
 
 const (

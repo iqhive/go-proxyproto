@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/pires/go-proxyproto"
-	h2proxy "github.com/pires/go-proxyproto/helper/http2"
+	"github.com/iqhive/go-proxyproto"
+	h2proxy "github.com/iqhive/go-proxyproto/helper/http2"
 )
 
 // TODO: add httpclient example

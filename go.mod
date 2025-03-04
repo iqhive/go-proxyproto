@@ -1,4 +1,4 @@
-module github.com/pires/go-proxyproto
+module github.com/iqhive/go-proxyproto
 
 go 1.18
 

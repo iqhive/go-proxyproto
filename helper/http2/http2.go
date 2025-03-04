@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pires/go-proxyproto"
+	"github.com/iqhive/go-proxyproto"
 	"golang.org/x/net/http2"
 )
 

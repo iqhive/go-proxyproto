@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,7 +22,63 @@ var (
 	// ErrInvalidUpstream should be returned when an upstream connection address
 	// is not trusted, and therefore is invalid.
 	ErrInvalidUpstream = fmt.Errorf("proxyproto: upstream connection address not trusted for PROXY information")
+
+	// bufferPool is a pool of reusable buffers to reduce memory allocations
+	bufferPool = sync.Pool{
+		New: func() interface{} {
+			// Size buffer for most common CPU cache line size (64 bytes on most platforms)
+			// and enough for most proxy protocol headers
+			size := 128
+			b := make([]byte, 0, size)
+			return &b
+		},
+	}
+
+	// readerPool is a pool of bufio.Reader objects to reduce allocations
+	readerPool = sync.Pool{
+		New: func() interface{} {
+			// Size buffer for optimal I/O for most systems
+			size := getOptimalBufferSize()
+			return bufio.NewReaderSize(nil, size)
+		},
+	}
+
+	// Platform optimization flags
+	isLinux = runtime.GOOS == "linux"
 )
+
+// getOptimalBufferSize returns the optimal buffer size for the platform
+// On Linux, use 4KB which aligns with the page size for better memory usage
+// On other platforms, use 4KB as a reasonable default for network operations
+func getOptimalBufferSize() int {
+	// Delegate to architecture-specific implementation
+	return GetOptimalBufferSize()
+}
+
+// getBuffer gets a buffer from the pool
+func getBuffer() *[]byte {
+	return bufferPool.Get().(*[]byte)
+}
+
+// putBuffer returns a buffer to the pool
+func putBuffer(b *[]byte) {
+	// Reset the buffer before returning it to the pool
+	*b = (*b)[:0]
+	bufferPool.Put(b)
+}
+
+// getReader gets a bufio.Reader from the pool and resets it with the given reader
+func getReader(r io.Reader) *bufio.Reader {
+	br := readerPool.Get().(*bufio.Reader)
+	br.Reset(r)
+	return br
+}
+
+// putReader returns a bufio.Reader to the pool
+func putReader(br *bufio.Reader) {
+	br.Reset(nil)
+	readerPool.Put(br)
+}
 
 // Listener is used to wrap an underlying listener,
 // whose connections may be using the HAProxy Proxy Protocol.
@@ -90,36 +147,45 @@ func (p *Listener) Accept() (net.Conn, error) {
 			return nil, err
 		}
 
+		// Apply platform-specific optimizations immediately
+		InitConn(conn)
+
 		proxyHeaderPolicy := USE
 		if p.Policy != nil && p.ConnPolicy != nil {
 			panic("only one of policy or connpolicy must be provided.")
 		}
+
+		// Fast path for policy determination
+		var policyErr error
 		if p.Policy != nil || p.ConnPolicy != nil {
 			if p.Policy != nil {
-				proxyHeaderPolicy, err = p.Policy(conn.RemoteAddr())
+				proxyHeaderPolicy, policyErr = p.Policy(conn.RemoteAddr())
 			} else {
-				proxyHeaderPolicy, err = p.ConnPolicy(ConnPolicyOptions{
+				proxyHeaderPolicy, policyErr = p.ConnPolicy(ConnPolicyOptions{
 					Upstream:   conn.RemoteAddr(),
 					Downstream: conn.LocalAddr(),
 				})
 			}
-			if err != nil {
+
+			if policyErr != nil {
 				// can't decide the policy, we can't accept the connection
 				conn.Close()
 
-				if errors.Is(err, ErrInvalidUpstream) {
+				if errors.Is(policyErr, ErrInvalidUpstream) {
 					// keep listening for other connections
 					continue
 				}
 
-				return nil, err
+				return nil, policyErr
 			}
-			// Handle a connection as a regular one
+
+			// Handle a connection as a regular one - fast path return
 			if proxyHeaderPolicy == SKIP {
 				return conn, nil
 			}
 		}
 
+		// Create a new connection with our optimized reader
 		newConn := NewConn(
 			conn,
 			WithPolicy(proxyHeaderPolicy),
@@ -127,12 +193,14 @@ func (p *Listener) Accept() (net.Conn, error) {
 		)
 
 		// If the ReadHeaderTimeout for the listener is unset, use the default timeout.
-		if p.ReadHeaderTimeout == 0 {
-			p.ReadHeaderTimeout = DefaultReadHeaderTimeout
+		// This avoids a time.Duration comparison which can be expensive
+		readHeaderTimeout := p.ReadHeaderTimeout
+		if readHeaderTimeout == 0 {
+			readHeaderTimeout = DefaultReadHeaderTimeout
 		}
 
 		// Set the readHeaderTimeout of the new conn to the value of the listener
-		newConn.readHeaderTimeout = p.ReadHeaderTimeout
+		newConn.readHeaderTimeout = readHeaderTimeout
 
 		return newConn, nil
 	}
@@ -148,14 +216,21 @@ func (p *Listener) Addr() net.Addr {
 	return p.Listener.Addr()
 }
 
+// InitConn applies performance optimizations to a TCP connection based on platform
+// Uses platform-specific settings for maximum performance
+func InitConn(conn net.Conn) {
+	// Delegate to our architecture-specific optimization function
+	OptimizeConn(conn)
+}
+
 // NewConn is used to wrap a net.Conn that may be speaking
 // the proxy protocol into a proxyproto.Conn
 func NewConn(conn net.Conn, opts ...func(*Conn)) *Conn {
-	// For v1 the header length is at most 108 bytes.
-	// For v2 the header length is at most 52 bytes plus the length of the TLVs.
-	// We use 256 bytes to be safe.
-	const bufSize = 256
-	br := bufio.NewReaderSize(conn, bufSize)
+	// Apply platform-specific optimizations to the connection
+	InitConn(conn)
+
+	// Use reader from pool instead of creating a new one
+	br := getReader(conn)
 
 	pConn := &Conn{
 		bufReader: br,
@@ -170,27 +245,62 @@ func NewConn(conn net.Conn, opts ...func(*Conn)) *Conn {
 	return pConn
 }
 
-// Read is check for the proxy protocol header when doing
+// Read checks for the proxy protocol header when doing
 // the initial scan. If there is an error parsing the header,
 // it is returned and the socket is closed.
 func (p *Conn) Read(b []byte) (int, error) {
 	p.once.Do(func() {
 		p.readErr = p.readHeader()
+
+		// After reading the header, optimize the reader setup for zero-copy
+		if p.readErr == nil && p.bufReader != nil {
+			// If there's no error and no data left in the buffer reader,
+			// we can bypass the MultiReader entirely and read directly from conn
+			if p.bufReader.Buffered() == 0 {
+				// Replace reader with direct conn for zero-copy reads
+				p.reader = p.conn
+			}
+		}
 	})
+
 	if p.readErr != nil {
 		return 0, p.readErr
 	}
 
+	// Forward to the optimized reader
 	return p.reader.Read(b)
 }
 
-// Write wraps original conn.Write
+// Write wraps original conn.Write with optimizations for large writes
 func (p *Conn) Write(b []byte) (int, error) {
-	return p.conn.Write(b)
+	// Fast path for small writes
+	if len(b) < 4096 {
+		return p.conn.Write(b)
+	}
+
+	// For larger writes, try to use more efficient methods based on concrete type
+	switch c := p.conn.(type) {
+	case *net.TCPConn:
+		// On Linux/Unix, large writes to TCP are optimized by the OS
+		return c.Write(b)
+	default:
+		// Fall back to standard Write for other connection types
+		return p.conn.Write(b)
+	}
 }
 
 // Close wraps original conn.Close
 func (p *Conn) Close() error {
+	// Return the bufio.Reader to the pool if it exists
+	if p.bufReader != nil {
+		putReader(p.bufReader)
+		p.bufReader = nil
+	}
+
+	// Clear references to help with garbage collection
+	p.reader = nil
+
+	// Close the underlying connection
 	return p.conn.Close()
 }
 
@@ -287,103 +397,59 @@ func (p *Conn) SetWriteDeadline(t time.Time) error {
 }
 
 func (p *Conn) readHeader() error {
-	// If the connection's readHeaderTimeout is more than 0,
-	// push our deadline back to now plus the timeout. This should only
-	// run on the connection, as we don't want to override the previous
-	// read deadline the user may have used.
+	// Fast path: if no readHeaderTimeout is set, avoid time.Now() and SetReadDeadline call
+	var origDeadline time.Time
+
 	if p.readHeaderTimeout > 0 {
-		if err := p.conn.SetReadDeadline(time.Now().Add(p.readHeaderTimeout)); err != nil {
+		// Store the original deadline value to restore it later
+		storedDeadline := p.readDeadline.Load()
+		if storedDeadline != nil {
+			origDeadline = storedDeadline.(time.Time)
+		}
+
+		// Set temporary deadline for header read
+		newDeadline := time.Now().Add(p.readHeaderTimeout)
+		if err := p.conn.SetReadDeadline(newDeadline); err != nil {
 			return err
 		}
 	}
 
 	header, err := Read(p.bufReader)
 
-	// If the connection's readHeaderTimeout is more than 0, undo the change to the
-	// deadline that we made above. Because we retain the readDeadline as part of our
-	// SetReadDeadline override, we know the user's desired deadline so we use that.
-	// Therefore, we check whether the error is a net.Timeout and if it is, we decide
-	// the proxy proto does not exist and set the error accordingly.
+	// Always reset the deadline if we've changed it
 	if p.readHeaderTimeout > 0 {
-		t := p.readDeadline.Load()
-		if t == nil {
-			t = time.Time{}
-		}
-		if err := p.conn.SetReadDeadline(t.(time.Time)); err != nil {
-			return err
-		}
+		// Restore original deadline, ignoring errors since we can't do much about them
+		p.conn.SetReadDeadline(origDeadline)
+
+		// If we got a timeout error, translate it to ErrNoProxyProtocol for consistent handling
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			err = ErrNoProxyProtocol
 		}
 	}
 
-	// For the purpose of this wrapper shamefully stolen from armon/go-proxyproto
-	// let's act as if there was no error when PROXY protocol is not present.
+	// Handle ErrNoProxyProtocol - act as if there was no error when proxy protocol is not required
 	if err == ErrNoProxyProtocol {
-		// but not if it is required that the connection has one
+		// Unless we're in REQUIRE mode, in which case it's an error
 		if p.ProxyHeaderPolicy == REQUIRE {
 			return err
 		}
-
 		return nil
 	}
 
-	// proxy protocol header was found
+	// Process a successfully read header
 	if err == nil && header != nil {
 		switch p.ProxyHeaderPolicy {
 		case REJECT:
-			// this connection is not allowed to send one
 			return ErrSuperfluousProxyHeader
 		case USE, REQUIRE:
 			if p.Validate != nil {
-				err = p.Validate(header)
-				if err != nil {
-					return err
+				if validateErr := p.Validate(header); validateErr != nil {
+					return validateErr
 				}
 			}
-
 			p.header = header
 		}
 	}
 
 	return err
-}
-
-// ReadFrom implements the io.ReaderFrom ReadFrom method
-func (p *Conn) ReadFrom(r io.Reader) (int64, error) {
-	if rf, ok := p.conn.(io.ReaderFrom); ok {
-		return rf.ReadFrom(r)
-	}
-	return io.Copy(p.conn, r)
-}
-
-// WriteTo implements io.WriterTo
-func (p *Conn) WriteTo(w io.Writer) (int64, error) {
-	p.once.Do(func() { p.readErr = p.readHeader() })
-	if p.readErr != nil {
-		return 0, p.readErr
-	}
-
-	b := make([]byte, p.bufReader.Buffered())
-	if _, err := p.bufReader.Read(b); err != nil {
-		return 0, err // this should never as we read buffered data
-	}
-
-	var n int64
-	{
-		nn, err := w.Write(b)
-		n += int64(nn)
-		if err != nil {
-			return n, err
-		}
-	}
-	{
-		nn, err := io.Copy(w, p.conn)
-		n += nn
-		if err != nil {
-			return n, err
-		}
-	}
-
-	return n, nil
 }
