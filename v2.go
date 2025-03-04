@@ -65,16 +65,6 @@ var (
 	}
 )
 
-// getPortBytes gets a 2-byte buffer from the pool
-func getPortBytes() *[]byte {
-	return portBytesPool.Get().(*[]byte)
-}
-
-// putPortBytes returns a 2-byte buffer to the pool
-func putPortBytes(b *[]byte) {
-	portBytesPool.Put(b)
-}
-
 // getUnixAddrBuffer gets a buffer from the pool for Unix addresses
 func getUnixAddrBuffer() *[]byte {
 	return unixAddrPool.Get().(*[]byte)
@@ -513,34 +503,4 @@ func parseUnixName(b []byte) string {
 		return string(b)
 	}
 	return string(b[:i])
-}
-
-// formatUnixName formats a Unix socket path for the proxy protocol
-func formatUnixName(name string) []byte {
-	// Get buffer from pool
-	bufPtr := getUnixAddrBuffer()
-	buf := *bufPtr
-
-	// Copy name into buffer
-	n := copy(buf, name)
-
-	// Add null terminator if needed and there's space
-	if n < len(buf) {
-		buf[n] = 0
-		n++
-	}
-
-	// Zero out the rest of the buffer
-	for i := n; i < len(buf); i++ {
-		buf[i] = 0
-	}
-
-	// Create a new slice to return - we can't return the pooled buffer directly
-	result := make([]byte, len(buf))
-	copy(result, buf)
-
-	// Return buffer to pool
-	putUnixAddrBuffer(bufPtr)
-
-	return result
 }
