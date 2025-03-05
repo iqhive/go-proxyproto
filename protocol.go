@@ -268,11 +268,20 @@ func (p *Conn) Read(b []byte) (int, error) {
 	}
 
 	// Forward to the optimized reader
+	if p.reader == nil {
+		return 0, io.EOF
+		// return 0, io.ErrClosedPipe
+	}
 	return p.reader.Read(b)
 }
 
 // Write wraps original conn.Write with optimizations for large writes
 func (p *Conn) Write(b []byte) (int, error) {
+	if p.conn == nil {
+		return 0, io.EOF
+		// return 0, io.ErrClosedPipe
+	}
+
 	// Fast path for small writes
 	if len(b) < 4096 {
 		return p.conn.Write(b)

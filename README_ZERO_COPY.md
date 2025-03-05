@@ -17,7 +17,7 @@ For Linux systems, we've implemented three different zero-copy mechanisms, each 
 
 1. **Netpoll** - Uses Go's internal network poller, which is built on top of epoll but managed by the Go runtime.
 2. **Epoll** - Uses Linux's epoll syscalls directly for maximum control over I/O multiplexing.
-3. **Splice** - Uses Linux's splice syscall for true zero-copy data movement between file descriptors within the kernel.
+3. **Splice** - Uses Linux's splice syscall for true zero-copy data movement between file descriptors within the kernel.e
 
 ### Choosing a Zero-Copy Implementation
 
